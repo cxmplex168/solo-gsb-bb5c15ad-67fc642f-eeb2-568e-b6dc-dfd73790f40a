@@ -5,6 +5,7 @@ API:
   PUT  /api/network                 整体保存管网输入(校验后覆盖)
   POST /api/plan                    常规求解并保存方案
   POST /api/plan-failover           单阀失效备援求解并保存方案
+  POST /api/plan-siting             新增阀门选址预览(只读, 不写管网/不入库)
   GET  /api/plans                   最近方案列表
   GET  /api/plans/{id}              方案详情(含节点/管段状态)
   POST /api/plans/{id}/sequence     可行方案的现场执行顺序规划(只读计算)
@@ -26,7 +27,7 @@ from pydantic import BaseModel, Field, field_validator
 import database
 from demo import DEMO_NETWORK
 from solver import (MAX_VALVES, NetworkValidationError, plan_sequence, solve,
-                    solve_failover)
+                    solve_failover, solve_siting)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -80,6 +81,24 @@ class SequenceIn(BaseModel):
     """
     durations: dict[str, Any] = Field(default_factory=dict)
     leak_weights: dict[str, Any] = Field(default_factory=dict)
+
+
+class CandidateIn(BaseModel):
+    """选址候选新阀录入。
+
+    各字段(唯一新阀编号/尚无阀门的管段/正整数安装费与关阀代价)在
+    solver.solve_siting 中复用图校验逐条检查, 以便返回明确错误。
+    """
+    id: Any = None
+    segment_id: Any = None
+    install_cost: Any = None
+    close_cost: Any = None
+
+
+class SitingIn(BaseModel):
+    """选址预览请求: 当前编辑中的管网(可空, 空则用已保存管网) + 候选位置。"""
+    network: NetworkIn | None = None
+    candidates: list[CandidateIn] = Field(default_factory=list)
 
 
 @asynccontextmanager
@@ -151,6 +170,28 @@ def create_failover_plan(net: NetworkIn | None = None) -> dict:
         plan_id = database.save_plan(conn, result, payload)
     result["id"] = plan_id
     return result
+
+
+@app.post("/api/plan-siting")
+def create_siting_plan(req: SitingIn) -> dict:
+    """新增阀门选址预览(独立 API, 只读: 不写管网、不写入历史方案)。
+
+    对当前编辑中的管网(请求体未带 network 时使用已保存管网), 在尚无阀门
+    的管段上评估至多 6 个候选新阀, 寻找漏点全隔离且必保点全有水的增设及
+    关阀方案: 只为实际关闭的候选阀计安装费, 先最小化安装费合计, 再最小化
+    本次关阀代价, 仍并列按新增管段编号列表、关阀编号列表字典序决胜。
+    """
+    if req.network is not None:
+        payload = _payload(req.network)
+    else:
+        with database.get_conn() as conn:
+            payload = database.load_network(conn)
+    try:
+        return solve_siting(payload,
+                            [c.model_dump() for c in req.candidates])
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422,
+                            detail={"errors": exc.errors})
 
 
 @app.get("/api/plans")

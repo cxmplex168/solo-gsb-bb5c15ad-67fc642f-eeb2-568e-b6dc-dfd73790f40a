@@ -5,6 +5,7 @@ const state = {
   nodes: [],
   segments: [],
   valves: [],
+  candidates: [], // 选址候选: {id, segment_id, install_cost, close_cost}
   result: null,
   layout: new Map(), // nodeId -> {x,y}
 };
@@ -180,10 +181,37 @@ function renderValves() {
     </tr>`).join("");
 }
 
+// 选址候选: 仅允许选尚无阀门的管段, 且多个候选不能共用一条管段
+function renderCandidates() {
+  const usedByValve = new Set(state.valves.map((v) => v.segment_id).filter(Boolean));
+  const taken = new Set(state.candidates.map((c) => c.segment_id).filter(Boolean));
+  $("#table-candidates tbody").innerHTML = state.candidates.map((c, i) => {
+    const opts = state.segments
+      .map((s) => s.id)
+      .filter((id) => id && (!usedByValve.has(id) || id === c.segment_id)
+        && (!taken.has(id) || id === c.segment_id));
+    const optHtml = opts.map((id) =>
+      `<option value="${esc(id)}"${id === c.segment_id ? " selected" : ""}>${esc(id)}</option>`
+    ).join("");
+    return `
+    <tr data-i="${i}">
+      <td><input data-f="id" value="${esc(c.id)}" placeholder="如 NV1"></td>
+      <td><select data-f="segment_id"><option value=""></option>${optHtml}</select></td>
+      <td><input data-f="install_cost" type="number" min="1" step="1" value="${esc(c.install_cost)}"></td>
+      <td><input data-f="close_cost" type="number" min="1" step="1" value="${esc(c.close_cost)}"></td>
+      <td class="act"><button data-del="candidate" title="删除">✕</button></td>
+    </tr>`;
+  }).join("");
+  $("#siting-hint").textContent =
+    `原阀 ${state.valves.length} 个 + 候选 ${state.candidates.length} 个（合计 ≤ 14）；` +
+    "安装费与关阀代价均为正整数，预览只读、不写入管网与历史方案";
+}
+
 function renderAll() {
   renderNodes();
   renderSegments();
   renderValves();
+  renderCandidates();
   drawCanvas();
 }
 
@@ -196,14 +224,16 @@ function bindTable(table, key, defaults) {
     const f = e.target.dataset.f;
     if (f === undefined) return;
     let val = e.target.value;
-    if (f === "cost") val = Number(val);
+    if (f === "cost" || f === "install_cost" || f === "close_cost") val = Number(val);
     state[key][i][f] = val;
-    // 节点编号变化会影响管段下拉; 阀门绑定影响仅在保存时校验
+    // 节点编号变化会影响管段下拉; 管段/阀门变化会影响候选管段下拉
     if (key === "nodes") renderSegments();
+    if (key === "segments" || key === "valves") renderCandidates();
     drawCanvas();
   });
   table.addEventListener("change", () => {
     if (key === "nodes") renderSegments();
+    if (key === "segments" || key === "valves") renderCandidates();
     drawCanvas();
   });
   table.addEventListener("click", (e) => {
@@ -227,6 +257,13 @@ document.querySelectorAll(".add-row").forEach((btn) => {
       }
       state.valves.push({ id: "", segment_id: "", cost: 1 });
     }
+    if (t === "candidates") {
+      if (state.candidates.length >= 6) {
+        showErrors(["候选位置最多 6 个"]);
+        return;
+      }
+      state.candidates.push({ id: "", segment_id: "", install_cost: 1, close_cost: 1 });
+    }
     renderAll();
   });
 });
@@ -234,6 +271,7 @@ document.querySelectorAll(".add-row").forEach((btn) => {
 bindTable($("#table-nodes"), "nodes");
 bindTable($("#table-segments"), "segments");
 bindTable($("#table-valves"), "valves");
+bindTable($("#table-candidates"), "candidates");
 $("#node-role-filter").addEventListener("change", renderNodes);
 
 // ---------- 结果渲染 ----------
@@ -368,6 +406,104 @@ function renderFailover(r, banner, body) {
     </div>`;
 }
 
+// ---------- 新增阀门选址预览 ----------
+// 只读预览: 不写管网、不入库方案; 结果展示在独立的 ③ 选址预览区。
+function renderSitingResult(r) {
+  const banner = $("#siting-banner");
+  const body = $("#siting-body");
+  banner.classList.remove("hidden", "ok", "bad");
+
+  if (!r.feasible) {
+    banner.classList.add("bad");
+    banner.innerHTML = `<span class="big">✗ 候选范围内不可修复</span>${esc(r.message)}`;
+    if (r.reason_detail && r.reason_detail.witness_path) {
+      banner.innerHTML += `<br><small>证据通路: ${esc(r.reason_detail.witness_path)}</small>`;
+    }
+    body.innerHTML = `
+      <div class="card"><h3>无解原因</h3>
+        <p>原因代码: <code>${esc(r.reason_code)}</code></p>
+        <p>${esc(r.message)}</p>
+        ${r.reason_detail ? `<pre>${esc(JSON.stringify(r.reason_detail, null, 2))}</pre>` : ""}
+      </div>`;
+    return;
+  }
+
+  banner.classList.add("ok");
+  banner.innerHTML =
+    `<span class="big">✓ 选址预览方案</span>${esc(r.message)}` +
+    `<br><small>共枚举 ${r.subset_count} 个「原阀 + 候选」关阀组合, 其中 ` +
+    `${r.isolating_subset_count} 个可隔离全部漏点。本结果为只读预览, 未写入管网与历史方案。</small>`;
+
+  const newValveTable = r.new_valves.length ? `
+    <table><thead><tr><th>新阀编号</th><th>安装管段</th><th>安装费</th><th>关阀代价</th></tr></thead>
+    <tbody>${r.new_valves.map((v) => `
+      <tr><td><b>${esc(v.id)}</b></td><td>${esc(v.segment_id)}</td>
+      <td>${esc(v.install_cost)}</td><td>${esc(v.close_cost)}</td></tr>`).join("")}
+    </tbody></table>` : "<p>无需增设新阀, 仅关闭原有阀门即可。</p>";
+
+  const closedTable = r.closed_valve_details.length ? `
+    <table><thead><tr><th>顺序</th><th>阀门编号</th><th>来源</th><th>绑定管段</th><th>安装费</th><th>关闭代价</th></tr></thead>
+    <tbody>${r.closed_valve_details.map((d, k) => `
+      <tr><td>${k + 1}</td><td><b>${esc(d.id)}</b></td>
+      <td>${d.is_new ? '<span class="tag flowing">新增</span>' : '<span class="tag dead">原有</span>'}</td>
+      <td>${esc(d.segment_id)}</td>
+      <td>${d.is_new ? esc(d.install_cost) : "—"}</td>
+      <td>${esc(d.close_cost)}</td></tr>`).join("")}
+    </tbody></table>` : "<p>无需关闭任何阀门。</p>";
+
+  body.innerHTML = `
+    <div class="card">
+      <h3>新增位置（${r.new_valves.length} 个）</h3>
+      ${newValveTable}
+    </div>
+
+    <div class="card">
+      <h3>费用</h3>
+      <div class="summary">
+        <span>安装费合计(仅实际关闭的候选阀): <b>${r.install_cost_total}</b></span>
+        <span>本次关阀代价合计: <b>${r.close_cost_total}</b></span>
+      </div>
+      <p class="role-name">优化次序: 先最小化安装费, 再最小化本次关阀代价(含新阀关阀代价与原有阀门关闭代价);
+      仍并列时按新增管段编号列表、关阀编号列表字典序决胜。</p>
+    </div>
+
+    <div class="card">
+      <h3>关阀清单（${r.closed_valves.length} 个）</h3>
+      ${closedTable}
+    </div>
+
+    <div class="card">
+      <h3>各节点供水状态（方案执行后）</h3>
+      ${nodeStatusTable(r.node_status)}
+    </div>
+
+    <div class="card">
+      <h3>各管段状态（方案执行后）</h3>
+      ${segmentStatusTable(r.segment_status)}
+    </div>`;
+}
+
+$("#btn-plan-siting").addEventListener("click", async () => {
+  clearErrors();
+  try {
+    const r = await api("POST", "/api/plan-siting", {
+      network: payloadFromUI(),
+      candidates: state.candidates
+        .filter((c) => c.id.trim() || c.segment_id.trim())
+        .map((c) => ({
+          id: c.id.trim(),
+          segment_id: c.segment_id.trim(),
+          install_cost: c.install_cost,
+          close_cost: c.close_cost,
+        })),
+    });
+    renderSitingResult(r);
+    $("#section-siting").scrollIntoView({ behavior: "smooth" });
+  } catch (err) {
+    showErrors(String(err.message).split("\n"));
+  }
+});
+
 // ---------- 现场执行顺序规划 ----------
 // 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)下方的规划卡片。
 // 只读计算, 不修改原方案。
@@ -387,7 +523,7 @@ function appendSequencePanel(r) {
 
   if (!r.closed_valves.length) {
     card.innerHTML = `
-      <h3>④ 现场执行顺序规划</h3>
+      <h3>现场执行顺序规划</h3>
       <p class="role-name">该可行方案不关闭任何阀门, 无操作时段, 累计暴露量为 0, 无需规划执行顺序。</p>`;
     body.appendChild(card);
     return;
@@ -536,9 +672,11 @@ $("#btn-clear").addEventListener("click", async () => {
   if (!confirm("确定清空全部节点、管段和阀门吗?")) return;
   await api("POST", "/api/clear");
   state.nodes = []; state.segments = []; state.valves = [];
+  state.candidates = [];
   state.result = null;
   $("#result-body").innerHTML = "";
   $("#result-banner").classList.add("hidden");
+  clearSitingResult();
   renderAll();
   loadHistory();
 });
@@ -578,14 +716,21 @@ $("#btn-plan-failover").addEventListener("click", async () => {
   }
 });
 
+function clearSitingResult() {
+  $("#siting-body").innerHTML = "";
+  $("#siting-banner").classList.add("hidden");
+}
+
 function applyNetwork(net) {
   state.nodes = (net.nodes || []).map((n) => ({ ...n, label: n.label || "" }));
   state.segments = (net.segments || []).map((s) => ({ ...s }));
   state.valves = (net.valves || []).map((v) => ({ ...v }));
+  state.candidates = [];
   state.layout.clear();
   state.result = null;
   $("#result-body").innerHTML = "";
   $("#result-banner").classList.add("hidden");
+  clearSitingResult();
   renderAll();
 }
 

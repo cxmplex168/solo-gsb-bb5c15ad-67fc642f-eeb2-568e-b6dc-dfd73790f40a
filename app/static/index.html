@@ -62,6 +62,19 @@
     <div id="input-errors" class="errors hidden"></div>
 
     <div class="card">
+      <h3>新增阀门选址候选（至多 6 个，限尚无阀门的管段）</h3>
+      <table id="table-candidates">
+        <thead><tr><th>新阀编号</th><th>安装管段</th><th>安装费</th><th>关阀代价</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <button class="add-row" data-table="candidates" type="button">＋ 添加候选位置</button>
+      <p>
+        <button id="btn-plan-siting" type="button" class="primary">选址预览求解</button>
+        <span class="role-name" id="siting-hint"></span>
+      </p>
+    </div>
+
+    <div class="card">
       <h3>管网示意</h3>
       <canvas id="canvas" width="960" height="420"></canvas>
       <div class="legend">
@@ -82,8 +95,14 @@
     <div id="result-body"></div>
   </section>
 
+  <section id="section-siting">
+    <h2>③ 新增阀门选址预览（只读，不写入管网与历史方案）</h2>
+    <div id="siting-banner" class="banner hidden"></div>
+    <div id="siting-body"></div>
+  </section>
+
   <section id="section-history">
-    <h2>③ 历史方案</h2>
+    <h2>④ 历史方案</h2>
     <table id="table-plans">
       <thead><tr><th>#</th><th>时间(UTC)</th><th>类型</th><th>是否可行</th><th>总代价</th><th>关闭阀门</th><th></th></tr></thead>
       <tbody></tbody>
