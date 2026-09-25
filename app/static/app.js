@@ -5,6 +5,7 @@ const state = {
   nodes: [],
   segments: [],
   valves: [],
+  candidates: [],
   result: null,
   layout: new Map(), // nodeId -> {x,y}
 };
@@ -25,7 +26,7 @@ const STATUS_TEXT = {
   closed: "已关阀",
   dead: "停水",
 };
-const SOLVER_TEXT = { base: "常规", failover: "单阀备援" };
+const SOLVER_TEXT = { base: "常规", failover: "单阀备援", siting: "选址预览" };
 const KIND_TEXT = {
   no_base_plan: "原本就没有常规可行方案",
   no_failover_plan: "仅缺少备援方案(存在常规可行方案)",
@@ -180,10 +181,36 @@ function renderValves() {
     </tr>`).join("");
 }
 
+// ---------- 新增阀门选址预览 ----------
+// 候选管段下拉: 仅尚无阀门的管段, 且未被其他候选行占用
+function candidateSegmentOptions(selected, selfIndex) {
+  const usedByValve = new Set(state.valves.map((v) => v.segment_id).filter(Boolean));
+  const usedByOthers = new Set(state.candidates
+    .filter((_, j) => j !== selfIndex)
+    .map((c) => c.segment_id).filter(Boolean));
+  return state.segments
+    .filter((s) => s.id && (s.id === selected
+      || (!usedByValve.has(s.id) && !usedByOthers.has(s.id))))
+    .map((s) => `<option value="${esc(s.id)}"${s.id === selected ? " selected" : ""}>${esc(s.id)}</option>`)
+    .join("");
+}
+
+function renderCandidates() {
+  $("#table-candidates tbody").innerHTML = state.candidates.map((c, i) => `
+    <tr data-i="${i}">
+      <td><select data-f="segment_id"><option value=""></option>${candidateSegmentOptions(c.segment_id, i)}</select></td>
+      <td><input data-f="id" value="${esc(c.id)}" placeholder="如 N1"></td>
+      <td><input data-f="install_cost" type="number" min="1" step="1" value="${esc(c.install_cost)}"></td>
+      <td><input data-f="close_cost" type="number" min="1" step="1" value="${esc(c.close_cost)}"></td>
+      <td class="act"><button data-del="candidate" title="删除">✕</button></td>
+    </tr>`).join("");
+}
+
 function renderAll() {
   renderNodes();
   renderSegments();
   renderValves();
+  renderCandidates();
   drawCanvas();
 }
 
@@ -200,10 +227,12 @@ function bindTable(table, key, defaults) {
     state[key][i][f] = val;
     // 节点编号变化会影响管段下拉; 阀门绑定影响仅在保存时校验
     if (key === "nodes") renderSegments();
+    renderCandidates(); // 无阀管段集合可能变化, 刷新候选下拉
     drawCanvas();
   });
   table.addEventListener("change", () => {
     if (key === "nodes") renderSegments();
+    renderCandidates();
     drawCanvas();
   });
   table.addEventListener("click", (e) => {
@@ -236,6 +265,62 @@ bindTable($("#table-segments"), "segments");
 bindTable($("#table-valves"), "valves");
 $("#node-role-filter").addEventListener("change", renderNodes);
 
+// ---------- 候选位置表格事件 ----------
+$("#btn-add-candidate").addEventListener("click", () => {
+  if (state.candidates.length >= 6) {
+    showErrors(["候选位置最多 6 个"]);
+    return;
+  }
+  const usedByValve = new Set(state.valves.map((v) => v.segment_id).filter(Boolean));
+  if (!state.segments.some((s) => s.id && !usedByValve.has(s.id))) {
+    showErrors(["没有可选的无阀管段, 请先在上方添加管段"]);
+    return;
+  }
+  clearErrors();
+  state.candidates.push({ segment_id: "", id: "", install_cost: 1, close_cost: 1 });
+  renderCandidates();
+});
+
+const candTable = $("#table-candidates");
+candTable.addEventListener("input", (e) => {
+  const tr = e.target.closest("tr");
+  if (!tr) return;
+  const f = e.target.dataset.f;
+  if (f === undefined) return;
+  let val = e.target.value;
+  if (f === "install_cost" || f === "close_cost") val = Number(val);
+  state.candidates[Number(tr.dataset.i)][f] = val;
+});
+candTable.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-del]");
+  if (!btn) return;
+  state.candidates.splice(Number(btn.closest("tr").dataset.i), 1);
+  renderCandidates();
+});
+
+$("#btn-plan-siting").addEventListener("click", async () => {
+  clearErrors();
+  const candidates = state.candidates
+    .filter((c) => c.segment_id.trim() || c.id.trim())
+    .map((c) => ({
+      segment_id: c.segment_id.trim(),
+      id: c.id.trim(),
+      install_cost: c.install_cost,
+      close_cost: c.close_cost,
+    }));
+  if (!candidates.length) {
+    showErrors(["请至少添加 1 个候选位置"]);
+    return;
+  }
+  try {
+    const r = await api("POST", "/api/plan-siting", { ...payloadFromUI(), candidates });
+    renderResult(r);
+    $("#section-result").scrollIntoView({ behavior: "smooth" });
+  } catch (err) {
+    showErrors(String(err.message).split("\n"));
+  }
+});
+
 // ---------- 结果渲染 ----------
 function showErrors(errors) {
   const box = $("#input-errors");
@@ -254,6 +339,12 @@ function renderResult(r) {
 
   if (!r.feasible) {
     renderInfeasible(r, banner, body);
+    drawCanvas();
+    return;
+  }
+
+  if (r.solver === "siting") {
+    renderSiting(r, banner, body);
     drawCanvas();
     return;
   }
@@ -292,7 +383,9 @@ function renderResult(r) {
 function renderInfeasible(r, banner, body) {
   banner.classList.add("bad");
   let head = "无解";
-  if (r.solver === "failover") {
+  if (r.solver === "siting") {
+    head = "候选范围内不可修复";
+  } else if (r.solver === "failover") {
     head = r.infeasible_kind === "no_failover_plan"
       ? "无备援方案"
       : "备援无解(常规规划本身无解)";
@@ -364,6 +457,69 @@ function renderFailover(r, banner, body) {
 
     <div class="card">
       <h3>各管段状态（正常执行时）</h3>
+      ${segmentStatusTable(r.segment_status)}
+    </div>`;
+}
+
+// ---------- 新增阀门选址预览结果 ----------
+function renderSiting(r, banner, body) {
+  banner.classList.add("ok");
+  banner.innerHTML =
+    `<span class="big">✓ 已求得增设及关阀方案(选址预览)</span>${esc(r.message)}` +
+    `<br><small>共枚举 ${r.subset_count} 个阀门组合(含 ${r.candidate_count} 个候选新阀), ` +
+    `其中 ${r.isolating_subset_count} 个可隔离全部漏点。只读预览: 未改动管网, 也未写入历史方案。</small>`;
+
+  const newRows = r.new_valves.length
+    ? r.new_valves.map((v, k) => `
+      <tr><td>${k + 1}</td><td>${esc(v.segment_id)}</td><td><b>${esc(v.valve_id)}</b></td>
+      <td>${esc(v.install_cost)}</td><td>${esc(v.close_cost)}</td></tr>`).join("")
+    : `<tr><td colspan="5" class="role-name">无需新增阀门(安装费 0)</td></tr>`;
+  const unused = (r.unused_candidates || [])
+    .map((c) => `${c.valve_id}(管段 ${c.segment_id})`).join(", ");
+
+  const newById = new Map(r.new_valves.map((v) => [v.valve_id, v]));
+  const closedRows = r.closed_valves.length
+    ? r.closed_valves.map((id, k) => {
+        const nv = newById.get(id);
+        if (nv) {
+          return `<tr><td>${k + 1}</td><td><b>${esc(id)}</b></td><td>${esc(nv.segment_id)}</td>
+            <td><span class="tag flowing">新增</span></td><td>${esc(nv.close_cost)}</td></tr>`;
+        }
+        const v = state.valves.find((x) => x.id === id) || {};
+        return `<tr><td>${k + 1}</td><td><b>${esc(id)}</b></td><td>${esc(v.segment_id || "—")}</td>
+          <td><span class="tag dead">现有</span></td><td>${esc(v.cost ?? "—")}</td></tr>`;
+      }).join("")
+    : `<tr><td colspan="5" class="role-name">无需关闭任何阀门</td></tr>`;
+
+  body.innerHTML = `
+    <div class="card">
+      <h3>新增阀门位置（${r.new_valves.length} 个, 安装费合计 ${r.install_cost}）</h3>
+      <table><thead><tr><th>顺序</th><th>新增管段</th><th>新阀编号</th><th>安装费</th><th>关阀代价</th></tr></thead>
+      <tbody>${newRows}</tbody></table>
+      ${unused ? `<p class="role-name">未采用的候选位置(不计安装费): ${esc(unused)}</p>` : ""}
+    </div>
+
+    <div class="card">
+      <h3>费用与优化目标</h3>
+      <p>安装费合计(仅实际关闭的候选阀计费): <b>${r.install_cost}</b><br>
+      本次关阀代价(全部关闭阀门的关阀代价之和): <b>${r.close_cost}</b></p>
+      <p class="role-name">目标次序: 先最小化安装费, 再最小化本次关阀代价;
+      仍并列时按新增管段编号列表、关阀编号列表字典序决胜。</p>
+    </div>
+
+    <div class="card">
+      <h3>本次关阀清单（${r.closed_valves.length} 个, 编号升序）</h3>
+      <table><thead><tr><th>顺序</th><th>阀门编号</th><th>绑定管段</th><th>来源</th><th>关阀代价</th></tr></thead>
+      <tbody>${closedRows}</tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>各节点供水状态</h3>
+      ${nodeStatusTable(r.node_status)}
+    </div>
+
+    <div class="card">
+      <h3>各管段状态</h3>
       ${segmentStatusTable(r.segment_status)}
     </div>`;
 }
@@ -536,6 +692,7 @@ $("#btn-clear").addEventListener("click", async () => {
   if (!confirm("确定清空全部节点、管段和阀门吗?")) return;
   await api("POST", "/api/clear");
   state.nodes = []; state.segments = []; state.valves = [];
+  state.candidates = [];
   state.result = null;
   $("#result-body").innerHTML = "";
   $("#result-banner").classList.add("hidden");
@@ -582,6 +739,7 @@ function applyNetwork(net) {
   state.nodes = (net.nodes || []).map((n) => ({ ...n, label: n.label || "" }));
   state.segments = (net.segments || []).map((s) => ({ ...s }));
   state.valves = (net.valves || []).map((v) => ({ ...v }));
+  state.candidates = [];
   state.layout.clear();
   state.result = null;
   $("#result-body").innerHTML = "";
@@ -673,15 +831,21 @@ function drawCanvas() {
   const nodeStatus = new Map(
     ((state.result && state.result.node_status) || []).map((n) => [n.id, n.status])
   );
+  // 管段上的阀门绑定: 编辑状态为主, 结果快照(如选址预览的新增阀)作补充
+  const segValve = new Map(state.segments.map((s) => [s.id, s.valve_id]));
+  for (const s of ((state.result && state.result.segment_status) || [])) {
+    if (s.valve_id && !segValve.get(s.id)) segValve.set(s.id, s.valve_id);
+  }
 
   // 管段
   for (const s of state.segments) {
     const a = state.layout.get(s.endpoint_a);
     const b = state.layout.get(s.endpoint_b);
     if (!a || !b) continue;
+    const vid = segValve.get(s.id);
     let color = "#5a6b7c", dash = [], width = 2;
     const st = segStatus.get(s.id);
-    if (s.valve_id && closedSet.has(s.valve_id)) {
+    if (vid && closedSet.has(vid)) {
       color = "#d13221"; dash = [7, 5]; width = 3;
     } else if (st === "flowing") {
       color = "#1c7fb3"; width = 3;
@@ -698,9 +862,9 @@ function drawCanvas() {
     ctx.setLineDash([]);
 
     // 阀门标记: 管段中点画小方块 + 编号
-    if (s.valve_id) {
+    if (vid) {
       const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-      const closed = closedSet.has(s.valve_id);
+      const closed = closedSet.has(vid);
       ctx.fillStyle = closed ? "#d13221" : "#fff";
       ctx.strokeStyle = "#444";
       ctx.lineWidth = 1.5;
@@ -709,7 +873,7 @@ function drawCanvas() {
       ctx.fill(); ctx.stroke();
       ctx.fillStyle = closed ? "#d13221" : "#333";
       ctx.font = "10px sans-serif";
-      ctx.fillText(s.valve_id, mx - 7, my - 10);
+      ctx.fillText(vid, mx - 7, my - 10);
     }
   }
 

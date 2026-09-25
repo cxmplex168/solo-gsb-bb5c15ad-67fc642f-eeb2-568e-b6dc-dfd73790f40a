@@ -5,6 +5,7 @@ API:
   PUT  /api/network                 整体保存管网输入(校验后覆盖)
   POST /api/plan                    常规求解并保存方案
   POST /api/plan-failover           单阀失效备援求解并保存方案
+  POST /api/plan-siting             新增阀门选址预览(只读计算, 不写管网与历史方案)
   GET  /api/plans                   最近方案列表
   GET  /api/plans/{id}              方案详情(含节点/管段状态)
   POST /api/plans/{id}/sequence     可行方案的现场执行顺序规划(只读计算)
@@ -25,8 +26,8 @@ from pydantic import BaseModel, Field, field_validator
 
 import database
 from demo import DEMO_NETWORK
-from solver import (MAX_VALVES, NetworkValidationError, plan_sequence, solve,
-                    solve_failover)
+from solver import (MAX_CANDIDATES, MAX_VALVES, NetworkValidationError,
+                    plan_sequence, solve, solve_failover, solve_siting)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -80,6 +81,28 @@ class SequenceIn(BaseModel):
     """
     durations: dict[str, Any] = Field(default_factory=dict)
     leak_weights: dict[str, Any] = Field(default_factory=dict)
+
+
+class CandidateIn(BaseModel):
+    """选址预览候选位置: 无阀管段 + 唯一新阀编号 + 正整数安装费/关阀代价。"""
+    id: str = Field(min_length=1)
+    segment_id: str = Field(min_length=1)
+    install_cost: int = Field(gt=0)
+    close_cost: int = Field(gt=0)
+
+    @field_validator("id", "segment_id")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
+
+
+class SitingIn(BaseModel):
+    """选址预览请求: 管网部分可整体省略(用已保存管网), 候选位置 1~6 个。"""
+    nodes: list[NodeIn] | None = None
+    segments: list[SegmentIn] | None = None
+    valves: list[ValveIn] | None = Field(default=None, max_length=MAX_VALVES)
+    candidates: list[CandidateIn] = Field(min_length=1,
+                                          max_length=MAX_CANDIDATES)
 
 
 @asynccontextmanager
@@ -151,6 +174,37 @@ def create_failover_plan(net: NetworkIn | None = None) -> dict:
         plan_id = database.save_plan(conn, result, payload)
     result["id"] = plan_id
     return result
+
+
+@app.post("/api/plan-siting")
+def create_siting_preview(req: SitingIn) -> dict:
+    """新增阀门选址预览(独立 API, 只读计算)。
+
+    请求体: nodes/segments/valves 三者一起提交(当前编辑中的管网), 或全部
+    省略(使用已保存管网); candidates 为 1~6 个候选位置。结果不写入管网,
+    也不保存到历史方案。
+    """
+    given = [req.nodes is not None, req.segments is not None,
+             req.valves is not None]
+    if any(given) and not all(given):
+        raise HTTPException(status_code=422, detail={"errors": [
+            "nodes/segments/valves 需同时提供; 三者全部省略时使用已保存管网"
+        ]})
+    if all(given):
+        payload = {
+            "nodes": [n.model_dump() for n in req.nodes or []],
+            "segments": [s.model_dump() for s in req.segments or []],
+            "valves": [v.model_dump() for v in req.valves or []],
+        }
+    else:
+        with database.get_conn() as conn:
+            payload = database.load_network(conn)
+    try:
+        return solve_siting(payload,
+                            [c.model_dump() for c in req.candidates])
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422,
+                            detail={"errors": exc.errors})
 
 
 @app.get("/api/plans")

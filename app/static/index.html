@@ -61,6 +61,24 @@
 
     <div id="input-errors" class="errors hidden"></div>
 
+    <div class="card" id="card-siting">
+      <h3>新增阀门选址预览 <span class="role-name">(只读试算, 不写入管网与历史方案)</span></h3>
+      <p class="role-name">
+        从<b>尚无阀门</b>的管段选择至多 <b>6</b> 个候选位置, 各录入唯一新阀编号、正整数安装费与关阀代价
+        (现有阀门与候选合计 ≤14)。寻找使全部漏点断开进水点、全部必保点仍有水的增设及关阀方案:
+        只为实际关闭的候选阀计安装费; 先最小化安装费, 再最小化本次关阀代价,
+        仍并列按新增管段编号列表、关阀编号列表字典序决胜。
+      </p>
+      <table id="table-candidates">
+        <thead><tr><th>候选管段(无阀)</th><th>新阀编号</th><th>安装费</th><th>关阀代价</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <button class="add-row" id="btn-add-candidate" type="button">＋ 添加候选位置</button>
+      <p style="margin:10px 0 0">
+        <button id="btn-plan-siting" type="button" class="primary">预览增设及关阀方案</button>
+      </p>
+    </div>
+
     <div class="card">
       <h3>管网示意</h3>
       <canvas id="canvas" width="960" height="420"></canvas>

@@ -22,6 +22,12 @@
 暴露量 = 时长 × 仍通水漏点权重之和; 用子集 DP 求累计暴露量最小的执行
 顺序, 同暴露量取阀门编号序列字典序最小者。
 
+另提供 solve_siting(payload, candidates): 新增阀门选址预览(只读计算,
+不写库)。候选位置选自尚无阀门的管段(至多 6 个), 各配唯一新阀编号、
+正整数安装费与关阀代价, 现有阀门与候选合计不超过 14 个; 把候选并入
+管网枚举全部关阀子集, 只为实际关闭的候选阀计安装费, 依次最小化
+安装费、本次关阀代价, 再按新增管段编号列表、关阀编号列表字典序决胜。
+
 阀门最多 14 个, 枚举全部 2^V 个子集(V<=14 => 16384), 对每个子集做
 BFS 连通性检查即可, 简单且确定。
 """
@@ -845,3 +851,188 @@ def plan_sequence(snapshot: dict[str, Any],
         "total_exposure": cum,
         "message": message,
     }
+
+
+# ---------------------------------------------------------------------------
+# 新增阀门选址预览(只读计算, 不修改管网、不写入历史方案)
+# ---------------------------------------------------------------------------
+
+MAX_CANDIDATES = 6
+
+
+def solve_siting(payload: dict[str, Any],
+                 candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """新增阀门选址预览求解。
+
+    在编辑中的管网上, 从尚无阀门的管段选出至多 MAX_CANDIDATES 个候选位置,
+    各配唯一新阀编号、正整数安装费与正整数关阀代价; 现有阀门与候选合计
+    不超过 MAX_VALVES 个。把候选看作"装上才能关闭"的新阀(关闭代价 = 录入
+    的关阀代价)并入管网, 枚举全部关阀子集, 寻找满足 (A) 全部漏点与所有
+    进水点断开 (B) 全部必保点仍连通至少一个进水点 的增设及关阀方案。
+    只有实际关闭的候选阀才计安装费。目标次序:
+      1. 安装费(实际关闭候选阀的安装费之和)最小;
+      2. 本次关阀代价(全部关闭阀门的关阀代价之和)最小;
+      3. 新增管段编号列表(升序)字典序最小;
+      4. 关阀编号列表(升序)字典序最小。
+    无解时复用常规无解原因分析, 并说明候选范围内不可修复。
+    """
+    nodes, segments, valves = validate_network(payload)
+    errors: list[str] = []
+
+    raw_cands = candidates if isinstance(candidates, list) else []
+    if not raw_cands:
+        errors.append("至少需要 1 个候选位置")
+    if len(raw_cands) > MAX_CANDIDATES:
+        errors.append(f"候选位置数量为 {len(raw_cands)}, "
+                      f"超过上限 {MAX_CANDIDATES} 个")
+
+    seg_by_id = {sg["id"]: sg for sg in segments}
+    existing_vids = {vl["id"] for vl in valves}
+    seen_ids: set[str] = set()
+    seen_segs: set[str] = set()
+    norm: list[dict[str, Any]] = []
+    for i, cd in enumerate(raw_cands):
+        if not isinstance(cd, dict):
+            errors.append(f"候选位置 #{i + 1}: 必须是对象")
+            continue
+        vid = _norm_id(cd.get("id"))
+        sid = _norm_id(cd.get("segment_id"))
+        if not vid:
+            errors.append(f"候选位置 #{i + 1}: 缺少新阀编号")
+        elif vid in existing_vids:
+            errors.append(f"新阀编号 {vid} 与现有阀门重复")
+        elif vid in seen_ids:
+            errors.append(f"新阀编号重复: {vid}")
+        if not sid:
+            errors.append(f"候选位置 {vid or i + 1}: 缺少候选管段")
+        elif sid not in seg_by_id:
+            errors.append(f"候选位置 {vid or i + 1}: 管段 {sid} 不存在")
+        elif seg_by_id[sid]["valve_id"]:
+            errors.append(f"管段 {sid} 已绑定阀门 "
+                          f"{seg_by_id[sid]['valve_id']}, 不能作为候选位置")
+        elif sid in seen_segs:
+            errors.append(f"管段 {sid} 被重复选为候选位置")
+        install = _positive_int(cd.get("install_cost"))
+        if install is None:
+            errors.append(f"候选阀门 {vid or i + 1}: 安装费必须是正整数, "
+                          f"收到: {cd.get('install_cost')!r}")
+        close = _positive_int(cd.get("close_cost"))
+        if close is None:
+            errors.append(f"候选阀门 {vid or i + 1}: 关阀代价必须是正整数, "
+                          f"收到: {cd.get('close_cost')!r}")
+        seen_ids.add(vid)
+        seen_segs.add(sid)
+        norm.append({"id": vid, "segment_id": sid,
+                     "install_cost": install, "close_cost": close})
+
+    if len(valves) + len(raw_cands) > MAX_VALVES:
+        errors.append(f"现有阀门 {len(valves)} 个与候选位置 "
+                      f"{len(raw_cands)} 个合计超过上限 {MAX_VALVES} 个")
+    if errors:
+        raise NetworkValidationError(errors)
+
+    # ---- 候选并入管网: 候选管段绑上新阀, 新阀关闭代价 = 录入的关阀代价 ----
+    cand_by_seg = {c["segment_id"]: c for c in norm}
+    aug_segments = []
+    for sg in segments:
+        sg2 = dict(sg)
+        cd = cand_by_seg.get(sg["id"])
+        if cd is not None:
+            sg2["valve_id"] = cd["id"]
+        aug_segments.append(sg2)
+    aug_valves = valves + [{"id": c["id"], "cost": c["close_cost"],
+                            "segment_id": c["segment_id"]} for c in norm]
+    g = _Graph(nodes, aug_segments, aug_valves)
+
+    # ---- 前置检查(与常规规划一致; 这两类情况增设阀门也无法修复) ----
+    if not g.inlet_set:
+        return _infeasible("NO_INLET",
+                           "管网中没有进水点, 任何方案都无法供水, "
+                           "候选范围内不可修复。", solver="siting")
+    base_reach = g.reachable(0, g.inlet_set)
+    already_off = g.keep_bits & ~base_reach
+    if already_off:
+        names = [g.nodes[i]["id"] for i in range(g.n)
+                 if (already_off >> i) & 1]
+        return _infeasible(
+            "GUARANTEED_ALREADY_DISCONNECTED",
+            "即使不关任何阀门, 以下必保点也无法连通任何进水点(关阀只会进一步"
+            "减少连通性), 候选范围内不可修复: " + ", ".join(names),
+            {"starved_guaranteed": names}, solver="siting")
+
+    # ---- 每个阀门的安装费(仅候选阀)与各子集的安装费/关阀代价 ----
+    cand_by_id = {c["id"]: c for c in norm}
+    install_of = [0] * g.nv
+    for b, vl in enumerate(g.valves_sorted):
+        cd = cand_by_id.get(vl["id"])
+        if cd is not None:
+            install_of[b] = cd["install_cost"]
+    subset_cost = g.subset_costs()
+    install_sum = [0] * g.total_masks
+    for m in range(1, g.total_masks):
+        low = m & -m
+        install_sum[m] = install_sum[m ^ low] + install_of[low.bit_length() - 1]
+
+    isolating_count = 0
+    best_mask = -1
+    best_key: tuple = ()
+    if not g.leak_set:
+        # 没有漏点: 无需增设或关闭任何阀门
+        best_mask = 0
+        isolating_count = 1
+    else:
+        for m in range(g.total_masks):
+            fed = g.reachable(m, g.inlet_set)
+            if (fed & g.leak_bits) == 0:
+                isolating_count += 1
+            else:
+                continue
+            if (fed & g.keep_bits) != g.keep_bits:
+                continue
+            new_segs = tuple(sorted(
+                g.valves_sorted[b]["segment_id"]
+                for b in range(g.nv) if (m >> b) & 1 and install_of[b]))
+            key = (install_sum[m], subset_cost[m], new_segs,
+                   tuple(g.closed_names(m)))
+            if best_mask < 0 or key < best_key:
+                best_mask, best_key = m, key
+        if best_mask < 0:
+            result = _explain_infeasible(g, isolating_count)
+            result["solver"] = "siting"
+            result["message"] = "候选范围内不可修复: " + result["message"]
+            return result
+
+    result = _build_statuses(g, best_mask, isolating_count)
+    result["solver"] = "siting"
+    v_idx = {vl["id"]: b for b, vl in enumerate(g.valves_sorted)}
+    adopted = sorted((c for c in norm
+                      if (best_mask >> v_idx[c["id"]]) & 1),
+                     key=lambda c: c["segment_id"])
+    install_total = sum(c["install_cost"] for c in adopted)
+    result["install_cost"] = install_total
+    result["close_cost"] = result["total_cost"]
+    result["new_valves"] = [
+        {"segment_id": c["segment_id"], "valve_id": c["id"],
+         "install_cost": c["install_cost"], "close_cost": c["close_cost"]}
+        for c in adopted]
+    adopted_ids = {c["id"] for c in adopted}
+    result["unused_candidates"] = [
+        {"segment_id": c["segment_id"], "valve_id": c["id"]}
+        for c in norm if c["id"] not in adopted_ids]
+    result["candidate_count"] = len(norm)
+
+    n_closed = len(result["closed_valves"])
+    if not g.leak_set:
+        result["message"] = ("管网中没有漏点, 无需增设或关闭任何阀门"
+                             "(安装费 0, 本次关阀代价 0)。")
+    elif adopted:
+        pos = "、".join(f"{c['id']}(管段 {c['segment_id']})" for c in adopted)
+        result["message"] = (
+            f"已找到增设及关阀方案: 新增 {len(adopted)} 个阀门({pos}), "
+            f"安装费 {install_total}; 本次共关闭 {n_closed} 个阀门, "
+            f"本次关阀代价 {result['total_cost']}。")
+    else:
+        result["message"] = (
+            f"无需新增阀门即可修复: 本次共关闭 {n_closed} 个现有阀门, "
+            f"本次关阀代价 {result['total_cost']}, 安装费 0。")
+    return result
